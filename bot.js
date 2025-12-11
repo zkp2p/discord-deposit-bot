@@ -210,29 +210,29 @@ function createDepositEmbed(depositInfo) {
 function postPlatformDeposit(depositId, platform) {
   const postKey = `${depositId}:${platform}`;
   const pending = pendingPlatformPosts.get(postKey);
-  
+
   console.log(`\n🚀 [Post] Attempting to post ${postKey}`);
-  
+
   if (!pending) {
     console.log(`   ❌ No pending data for ${postKey}`);
     return;
   }
-  
+
   console.log(`   📋 Currencies in this pending: [${pending.currencies.map(c => c.currency).join(', ')}]`);
-  
+
   // Clear timeout
   if (pending.postTimeout) {
     clearTimeout(pending.postTimeout);
     pending.postTimeout = null;
   }
-  
+
   // Check if already posted (Level 4 dedup)
   if (postedDeposits.has(postKey)) {
     console.log(`   ❌ Already in postedDeposits, skipping`);
     pendingPlatformPosts.delete(postKey);
     return;
   }
-  
+
   // Mark as posted SYNCHRONOUSLY
   postedDeposits.add(postKey);
   pendingPlatformPosts.delete(postKey);
@@ -330,6 +330,7 @@ class ResilientWebSocketProvider {
     this.maxReconnectAttempts = 50;
     this.isConnecting = false;
     this.isDestroyed = false;
+    this.isListening = false;
     this.provider = null;
     this.reconnectTimer = null;
     this.keepAliveTimer = null;
@@ -343,16 +344,20 @@ class ResilientWebSocketProvider {
 
     try {
       console.log(`🔌 [${this.name}] Connecting (attempt ${this.reconnectAttempts + 1})...`);
-      if (this.provider) await this.cleanup();
+
+      if (this.provider) {
+        await this.cleanup();
+        this.provider = null;
+      }
 
       this.provider = new WebSocketProvider(this.url);
       this.setupEventListeners();
-      
+
       await Promise.race([
         this.provider.getNetwork(),
         new Promise((_, rej) => setTimeout(() => rej(new Error('Timeout')), 15000))
       ]);
-      
+
       console.log(`✅ [${this.name}] Connected`);
       this.lastActivityTime = Date.now();
       this.reconnectAttempts = 0;
@@ -370,6 +375,7 @@ class ResilientWebSocketProvider {
     if (!this.provider) return;
     try {
       this.stopKeepAlive();
+      this.isListening = false;  // Reset listening flag
       this.provider.removeAllListeners();
       if (this.provider._websocket) {
         this.provider._websocket.removeAllListeners();
@@ -416,13 +422,22 @@ class ResilientWebSocketProvider {
 
   setupContractListening() {
     if (!this.provider || this.isDestroyed) return;
+
+    // Prevent duplicate subscriptions
+    if (this.isListening) {
+      console.log(`⚠️ [${this.name}] Already listening, skipping duplicate subscription`);
+      return;
+    }
+
     try {
+      this.isListening = true;
       this.provider.on({ address: this.contractAddress.toLowerCase() }, (log) => {
         this.lastActivityTime = Date.now();
         this.eventHandler(log);
       });
       console.log(`👂 [${this.name}] Listening on: ${this.contractAddress}`);
     } catch (e) {
+      this.isListening = false;
       if (!this.isDestroyed) this.scheduleReconnect();
     }
   }
@@ -470,11 +485,14 @@ const handleEscrowV3Event = (log) => {
 
   // LEVEL 1: Event-level deduplication
   const eventKey = `${log.transactionHash}:${log.index}`;
+
   if (processedEvents.has(eventKey)) {
-    console.log(`⚠️ [Event] Duplicate ${eventKey}`);
+    console.log(`⚠️ [Event] Duplicate event skipped: ${eventKey}`);
     return;
   }
   processedEvents.add(eventKey);
+
+  console.log(`📥 [Event] Processing: ${eventKey}`);
 
   try {
     const parsed = escrowV3Iface.parseLog({ data: log.data, topics: log.topics });
